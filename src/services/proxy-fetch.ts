@@ -10,12 +10,9 @@ import { string2Uint8Array, uint8Array2String } from '~utils/encoding'
 import { streamAsyncIterable } from '~utils/stream-async-iterable'
 
 export function setupProxyExecutor() {
-  // one port for one fetch request
   Browser.runtime.onConnect.addListener((port) => {
     const abortController = new AbortController()
-    port.onDisconnect.addListener(() => {
-      abortController.abort()
-    })
+    port.onDisconnect.addListener(() => abortController.abort())
     port.onMessage.addListener(async (message: ProxyFetchRequestMessage) => {
       console.debug('proxy fetch', message.url, message.options)
       const resp = await fetch(message.url, {
@@ -44,18 +41,23 @@ export function setupProxyExecutor() {
 
 export async function proxyFetch(tabId: number, url: string, options?: RequestInitSubset): Promise<Response> {
   console.debug('proxyFetch', tabId, url, options)
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const port = Browser.tabs.connect(tabId, { name: uuid() })
+    let settled = false
     port.onDisconnect.addListener(() => {
-      throw new DOMException('proxy fetch aborted', 'AbortError')
+      if (!settled) {
+        reject(new DOMException('proxy fetch aborted', 'AbortError'))
+      }
     })
     options?.signal?.addEventListener('abort', () => port.disconnect())
+    const { signal: _signal, ...messageOptions } = options || {}
     const body = new ReadableStream({
       start(controller) {
         port.onMessage.addListener(function onMessage(
           message: ProxyFetchResponseMetadataMessage | ProxyFetchResponseBodyChunkMessage,
         ) {
           if (message.type === 'PROXY_RESPONSE_METADATA') {
+            settled = true
             const response = new Response(body, message.metadata)
             resolve(response)
           } else if (message.type === 'PROXY_RESPONSE_BODY_CHUNK') {
@@ -64,14 +66,13 @@ export async function proxyFetch(tabId: number, url: string, options?: RequestIn
               port.onMessage.removeListener(onMessage)
               port.disconnect()
             } else {
-              const chunk = string2Uint8Array(message.value)
-              controller.enqueue(chunk)
+              controller.enqueue(string2Uint8Array(message.value))
             }
           }
         })
-        port.postMessage({ url, options } as ProxyFetchRequestMessage)
+        port.postMessage({ url, options: messageOptions } as ProxyFetchRequestMessage)
       },
-      cancel(_reason: string) {
+      cancel() {
         port.disconnect()
       },
     })

@@ -1,145 +1,189 @@
-import { FetchError, ofetch } from 'ofetch'
-import Browser from 'webextension-polyfill'
-import { requestHostPermission } from '~app/utils/permissions'
+import { v4 as uuidv4 } from 'uuid'
 import { ChatError, ErrorCode } from '~utils/errors'
-import { streamAsyncIterable } from '~utils/stream-async-iterable'
+import { parseSSEResponse } from '~utils/sse'
 import { AbstractBot, SendMessageParams } from '../abstract-bot'
+import { grokWebClient } from './client'
 
-const AUTHORIZATION_VALUE =
-  'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA'
-
-interface StreamMessage {
-  result: {
-    sender: string
-    message: string
-    query: string
-  }
-}
-
-interface ChatMessage {
-  sender: 1 | 2
-  message: string
-}
+const FALLBACK_STATSIG_ID =
+  'ZTpUeXBlRXJyb3I6IENhbm5vdCByZWFkIHByb3BlcnRpZXMgb2YgdW5kZWZpbmVkIChyZWFkaW5nICdjaGlsZE5vZGVzJyk='
 
 interface ConversationContext {
   conversationId: string
-  messages: ChatMessage[]
+  lastResponseId?: string
+}
+
+interface GrokStreamPayload {
+  result?: {
+    conversation?: {
+      conversationId?: string
+    }
+    response?: GrokStreamResponse
+    responseId?: string
+    token?: string
+    messageTag?: string
+    isThinking?: boolean
+    isSoftStop?: boolean
+    finalMetadata?: unknown
+    modelResponse?: {
+      message?: string
+    }
+  }
+}
+
+interface GrokStreamResponse {
+  responseId?: string
+  token?: string
+  messageTag?: string
+  isThinking?: boolean
+  isSoftStop?: boolean
+  finalMetadata?: unknown
+  modelResponse?: {
+    message?: string
+  }
+}
+
+function buildCommonPayload() {
+  return {
+    fileAttachments: [],
+    imageAttachments: [],
+    disableSearch: false,
+    enableImageGeneration: true,
+    returnImageBytes: false,
+    returnRawGrokInXaiRequest: false,
+    enableImageStreaming: true,
+    imageGenerationCount: 2,
+    forceConcise: false,
+    enableSideBySide: true,
+    sendFinalMetadata: true,
+    disableTextFollowUps: false,
+    disableMemory: false,
+    forceSideBySide: false,
+    isAsyncChat: false,
+    disableSelfHarmShortCircuit: false,
+    collectionIds: [],
+    disabledConnectorIds: [],
+    deviceEnvInfo: {
+      darkModeEnabled: false,
+      devicePixelRatio: window.devicePixelRatio || 1,
+      screenWidth: window.screen.width,
+      screenHeight: window.screen.height,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+    },
+    linkQuery: false,
+  }
 }
 
 export class GrokWebBot extends AbstractBot {
-  private csrfToken?: string
   private conversationContext?: ConversationContext
 
-  constructor() {
-    super()
-  }
-
   async doSendMessage(params: SendMessageParams) {
-    if (!(await requestHostPermission('https://*.twitter.com/'))) {
-      throw new ChatError('Missing twitter.com permission', ErrorCode.MISSING_HOST_PERMISSION)
+    const path = this.conversationContext
+      ? `/rest/app-chat/conversations/${this.conversationContext.conversationId}/responses`
+      : '/rest/app-chat/conversations/new'
+
+    const payload = this.conversationContext
+      ? {
+          message: params.prompt,
+          parentResponseId: this.conversationContext.lastResponseId,
+          ...buildCommonPayload(),
+          metadata: {},
+          modeId: 'fast',
+        }
+      : {
+          temporary: false,
+          message: params.prompt,
+          ...buildCommonPayload(),
+          responseMetadata: {},
+          modeId: 'fast',
+        }
+
+    const resp = await grokWebClient.fetch(path, {
+      method: 'POST',
+      signal: params.signal,
+      credentials: 'include',
+      headers: {
+        Accept: 'text/event-stream',
+        'Content-Type': 'application/json',
+        'x-statsig-id': FALLBACK_STATSIG_ID,
+        'x-xai-request-id': uuidv4(),
+      },
+      body: JSON.stringify(payload),
+    })
+
+    if (resp.status === 401 || resp.status === 403) {
+      throw new ChatError(
+        'Please sign in to grok.com in this browser and finish browser verification.',
+        ErrorCode.GROK_UNAVAILABLE,
+      )
+    }
+    if (resp.status === 429) {
+      throw new ChatError('Grok rate limit exceeded. Please try again later.', ErrorCode.GROK_UNAVAILABLE)
     }
 
-    if (!this.csrfToken) {
-      this.csrfToken = await this.readCsrfToken()
+    let result = ''
+    let done = false
+    let fallbackMessage = ''
+
+    await parseSSEResponse(resp, (message) => {
+      if (message === '[DONE]') {
+        done = true
+        return
+      }
+
+      let payload: GrokStreamPayload
+      try {
+        payload = JSON.parse(message)
+      } catch (err) {
+        console.debug('Ignoring unknown Grok stream frame', message, err)
+        return
+      }
+
+      const streamResult = payload.result
+      if (!streamResult) {
+        return
+      }
+
+      const conversationId = streamResult.conversation?.conversationId
+      if (conversationId) {
+        this.conversationContext = {
+          conversationId,
+          lastResponseId: this.conversationContext?.lastResponseId,
+        }
+      }
+
+      const response = streamResult.response || streamResult
+      if (response.responseId && this.conversationContext) {
+        this.conversationContext.lastResponseId = response.responseId
+      }
+
+      if (response.modelResponse?.message) {
+        fallbackMessage = response.modelResponse.message
+      }
+
+      if (response.messageTag === 'final' && response.isThinking !== true && response.token !== undefined) {
+        result += response.token
+        params.onEvent({ type: 'UPDATE_ANSWER', data: { text: result } })
+      }
+
+      if (response.isSoftStop || response.finalMetadata) {
+        done = true
+      }
+    })
+
+    if (!result && fallbackMessage) {
+      result = fallbackMessage
+      params.onEvent({ type: 'UPDATE_ANSWER', data: { text: result } })
     }
 
     if (!this.conversationContext) {
-      const conversationId = await this.getConversationId()
-      this.conversationContext = { conversationId, messages: [] }
+      throw new Error('Grok stream did not return a conversation id')
     }
 
-    this.conversationContext.messages.push({ sender: 1, message: params.prompt })
-
-    const resp = await fetch('https://api.twitter.com/2/grok/add_response.json', {
-      method: 'POST',
-      headers: {
-        Authorization: AUTHORIZATION_VALUE,
-        'x-csrf-token': this.csrfToken!,
-      },
-      body: JSON.stringify({
-        conversationId: this.conversationContext.conversationId,
-        responses: this.conversationContext.messages,
-        systemPromptName: 'fun',
-      }),
-      signal: params.signal,
-    })
-
-    if (!resp.ok) {
-      throw new Error(resp.status.toString() + ' ' + (await resp.text()))
+    if (!done) {
+      console.debug('Grok stream ended without an explicit terminal event')
     }
-
-    const decoder = new TextDecoder()
-    let result = ''
-
-    for await (const uint8Array of streamAsyncIterable(resp.body!)) {
-      const str = decoder.decode(uint8Array)
-      console.debug('grok stream', str)
-      const lines = str.split('\n')
-      for (const line of lines) {
-        if (!line) {
-          continue
-        }
-        const payload: StreamMessage = JSON.parse(line)
-        if (!payload.result) {
-          continue
-        }
-        if (!result && !payload.result.message && payload.result.query) {
-          params.onEvent({ type: 'UPDATE_ANSWER', data: { text: '_' + payload.result.query + '_' } })
-        } else {
-          const text = payload.result.message
-          if (text.startsWith('[link]')) {
-            // [link](#tweet=1711679181984346515)\n\n==\n\n[link](#tweet=1663711402643845122)
-            // skip special Twitter card message for now
-          } else {
-            result += text
-            params.onEvent({ type: 'UPDATE_ANSWER', data: { text: result } })
-          }
-        }
-      }
-    }
-
-    this.conversationContext.messages.push({ sender: 2, message: result })
     params.onEvent({ type: 'DONE' })
-  }
-
-  private async getConversationId(): Promise<string> {
-    try {
-      const resp = await ofetch('https://twitter.com/i/api/2/grok/conversation_id.json', {
-        headers: {
-          Authorization: AUTHORIZATION_VALUE,
-          'x-csrf-token': this.csrfToken!,
-        },
-      })
-      return resp.conversationId
-    } catch (err) {
-      if (err instanceof FetchError) {
-        if (err.status === 401) {
-          throw new ChatError('Grok is only available to Twitter Premium+ subscribers', ErrorCode.GROK_UNAVAILABLE)
-        }
-        if (err.status === 451) {
-          throw new ChatError('Grok is not available in your country', ErrorCode.GROK_UNAVAILABLE)
-        }
-        // csrf & cookie mismatch
-        if (err.status === 403) {
-          this.csrfToken = await this.readCsrfToken({ refresh: true })
-          return this.getConversationId()
-        }
-      }
-      throw err
-    }
-  }
-
-  private async readCsrfToken({ refresh }: { refresh?: boolean } = {}): Promise<string> {
-    const token = await Browser.runtime.sendMessage({
-      type: 'read-twitter-csrf-token',
-      data: { refresh },
-      target: 'background',
-    })
-    console.debug('twitter csrf token', token)
-    if (!token) {
-      throw new ChatError('There is no logged-in Twitter account in this browser.', ErrorCode.TWITTER_UNAUTHORIZED)
-    }
-    return token
   }
 
   resetConversation() {
@@ -147,6 +191,6 @@ export class GrokWebBot extends AbstractBot {
   }
 
   get name() {
-    return 'Grok'
+    return 'Grok (webapp)'
   }
 }

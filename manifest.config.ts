@@ -27,6 +27,7 @@ export default defineManifest(async () => {
       'https://*.poe.com/',
       'https://*.anthropic.com/',
       'https://*.claude.ai/',
+      'https://grok.com/',
     ],
     optional_host_permissions: ['https://*/*', 'wss://*/*'],
     permissions: ['storage', 'unlimitedStorage', 'sidePanel', 'declarativeNetRequestWithHostAccess', 'scripting'],
@@ -34,6 +35,10 @@ export default defineManifest(async () => {
       {
         matches: ['https://chat.openai.com/*'],
         js: ['src/content-script/chatgpt-inpage-proxy.ts'],
+      },
+      {
+        matches: ['https://grok.com/*'],
+        js: ['src/content-script/grok-inpage-proxy.ts'],
       },
     ],
     commands: {
